@@ -7,6 +7,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ✅ Static (ako imaš index.html u rootu projekta)
+app.use(express.static(__dirname));
+
 // Render/hosting port
 const PORT = process.env.PORT || 3000;
 
@@ -14,9 +17,10 @@ const PORT = process.env.PORT || 3000;
 const MONGO_URL = process.env.MONGO_URL;
 const DB_NAME = process.env.MONGO_DB_NAME || "iot";
 
-// Real-time TTL (kad nema novih podataka -> izbaci iz live stanja)
-const DEVICE_TTL_MS = Number(process.env.DEVICE_TTL_MS || 60_000); // npr 60000 = 60s
+// Real-time TTL
+const DEVICE_TTL_MS = Number(process.env.DEVICE_TTL_MS || 60_000);
 const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 5_000);
+const LIVE_BUFFER_MAX = Number(process.env.LIVE_BUFFER_MAX || 50);
 
 // ================== MONGODB SCHEMAS ==================
 
@@ -31,7 +35,7 @@ const TemperatureSchema = new mongoose.Schema({
 const MessageSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now },
   device_unique_id: { type: String, required: true, index: true },
-  message: { type: mongoose.Schema.Types.Mixed, required: true }, // ceo payload
+  message: { type: mongoose.Schema.Types.Mixed, required: true },
 });
 
 const DeviceMessageSchema = new mongoose.Schema({
@@ -41,51 +45,52 @@ const DeviceMessageSchema = new mongoose.Schema({
   consumed: { type: Boolean, default: false },
 });
 
-// ================== MONGODB MODELS ==================
-
 const Temperature = mongoose.model("Temperature", TemperatureSchema);
 const Message = mongoose.model("Message", MessageSchema);
 const DeviceMessage = mongoose.model("DeviceMessage", DeviceMessageSchema);
 
 // ================== REAL-TIME STATE (RAM) ==================
-// Umesto “liveBuffer” globalno, držimo:
-const liveSamples = []; // zadnjih N sample-ova (za graf)
+
+const liveSamples = []; // graf (zadnjih N)
 const lastSeenByDevice = new Map(); // device_id -> lastSeenMs
-const lastSampleByDevice = new Map(); // device_id -> poslednji sample (za dashboard)
+const lastSampleByDevice = new Map(); // device_id -> poslednji sample
 
-const LIVE_BUFFER_MAX = Number(process.env.LIVE_BUFFER_MAX || 50);
-
-// Cleanup: izbaci uređaje iz real-time stanja kad istekne TTL
+// Cleanup expired devices
 setInterval(() => {
   const now = Date.now();
   for (const [deviceId, lastSeen] of lastSeenByDevice.entries()) {
     if (now - lastSeen > DEVICE_TTL_MS) {
       lastSeenByDevice.delete(deviceId);
       lastSampleByDevice.delete(deviceId);
-      // napomena: liveSamples ostaje kao graf istorija u RAM-u (poslednjih N),
-      // ali uređaj nestaje sa “live devices” liste.
       console.log("🟡 Device expired from live state:", deviceId);
     }
   }
 }, CLEANUP_INTERVAL_MS);
 
 // ================== DB CONNECT ==================
+
 async function connectMongo() {
   if (!MONGO_URL) {
     console.error("❌ MONGO_URL nije postavljen (env var).");
     process.exit(1);
   }
 
-  try {
-    await mongoose.connect(MONGO_URL, { dbName: DB_NAME });
-    console.log("✅ MongoDB povezano:", DB_NAME);
-  } catch (err) {
-    console.error("❌ MongoDB greška:", err.message);
-    process.exit(1);
-  }
+  await mongoose.connect(MONGO_URL, { dbName: DB_NAME });
+  console.log("✅ MongoDB povezano:", DB_NAME);
 }
 
 // ================== ROUTES ==================
+
+// ✅ Root JSON (brzi test da si deployovao novu verziju)
+app.get("/__version", (req, res) => {
+  res.json({
+    ok: true,
+    name: "iot-backend",
+    version: "live-devices-enabled",
+    mongoReadyState: mongoose.connection.readyState,
+    ttlMs: DEVICE_TTL_MS,
+  });
+});
 
 app.get("/health", (req, res) => {
   res.json({
@@ -95,7 +100,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Pico šalje POST /api/ingest { device_unique_id, temp, fan, mode? }
+// Pico -> POST /api/ingest { device_unique_id, temp, fan, mode? }
 app.post("/api/ingest", async (req, res) => {
   try {
     const { device_unique_id, temp, fan, mode } = req.body;
@@ -112,7 +117,7 @@ app.post("/api/ingest", async (req, res) => {
     const fanNum = Number.isFinite(Number(fan)) ? Number(fan) : 0;
     const modeStr = typeof mode === "string" ? mode : null;
 
-    const now = Date.now();
+    const nowMs = Date.now();
     const sample = {
       device_unique_id,
       value: tempNum,
@@ -121,21 +126,20 @@ app.post("/api/ingest", async (req, res) => {
       timestamp: new Date(),
     };
 
-    // 1) REAL-TIME: upiši u RAM (live)
-    lastSeenByDevice.set(device_unique_id, now);
+    // 1) LIVE state
+    lastSeenByDevice.set(device_unique_id, nowMs);
     lastSampleByDevice.set(device_unique_id, sample);
 
     liveSamples.push(sample);
     if (liveSamples.length > LIVE_BUFFER_MAX) liveSamples.shift();
 
-    // 2) PERSIST: upiši u Mongo (istorija)
+    // 2) Mongo persist
     if (mongoose.connection.readyState === 1) {
       await Message.create({
         device_unique_id,
         message: req.body,
         timestamp: new Date(),
       });
-
       await Temperature.create(sample);
     }
 
@@ -146,12 +150,12 @@ app.post("/api/ingest", async (req, res) => {
   }
 });
 
-// Live graf: zadnjih N sample-ova u RAM-u
+// Live graf (RAM)
 app.get("/api/data", (req, res) => {
   res.json(liveSamples);
 });
 
-// Live devices: trenutno aktivni (nisu “expired”)
+// ✅ Live devices (RAM)
 app.get("/api/live-devices", (req, res) => {
   const now = Date.now();
   const result = [];
@@ -160,7 +164,6 @@ app.get("/api/live-devices", (req, res) => {
     const lastSeen = lastSeenByDevice.get(deviceId) || 0;
     const ageMs = now - lastSeen;
 
-    // Ako je baš na ivici, nemoj vraćati
     if (ageMs <= DEVICE_TTL_MS) {
       result.push({
         device_unique_id: deviceId,
@@ -171,13 +174,11 @@ app.get("/api/live-devices", (req, res) => {
     }
   }
 
-  // najskoriji prvi
   result.sort((a, b) => b.lastSeenMs - a.lastSeenMs);
-
   res.json(result);
 });
 
-// Istorija iz baze (ne briše se na disconnect)
+// Istorija iz baze (Mongo)
 app.get("/api/db-data", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 50), 500);
@@ -195,7 +196,7 @@ app.get("/api/db-data", async (req, res) => {
   }
 });
 
-// UI šalje komandu uređaju
+// UI -> POST /api/device-message
 app.post("/api/device-message", async (req, res) => {
   try {
     const { device_unique_id, params_to_send } = req.body;
@@ -221,7 +222,7 @@ app.post("/api/device-message", async (req, res) => {
   }
 });
 
-// Pico povlači komandu: GET /api/device-message/:device_unique_id
+// Pico -> GET /api/device-message/:device_unique_id
 app.get("/api/device-message/:device_unique_id", async (req, res) => {
   try {
     const { device_unique_id } = req.params;
@@ -251,12 +252,33 @@ app.get("/api/device-message/:device_unique_id", async (req, res) => {
   }
 });
 
-// (opciono) ako želiš da Render servira index.html
+// ✅ Ako baš želiš da / vraća index.html kad postoji, a ako ne postoji JSON
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
+  const p = path.join(__dirname, "index.html");
+  // express.static će ga već servirati ako postoji,
+  // ali ovo je fallback:
+  res.sendFile(p, (err) => {
+    if (err) {
+      res.json({ ok: true, hint: "Upload index.html or use /__version" });
+    }
+  });
+});
+
+// ✅ Catch-all 404 JSON (lakše za debug)
+app.use((req, res) => {
+  res.status(404).json({ error: "not found", path: req.path });
 });
 
 // ================== START ==================
-connectMongo().then(() => {
-  app.listen(PORT, () => console.log(`✅ Server radi na portu ${PORT}`));
-});
+(async () => {
+  try {
+    await connectMongo();
+    app.listen(PORT, () => {
+      console.log(`✅ Server radi na portu ${PORT}`);
+      console.log("✅ Routes: /health, /__version, /api/ingest, /api/data, /api/live-devices, /api/db-data, /api/device-message");
+    });
+  } catch (e) {
+    console.error("❌ Startup error:", e);
+    process.exit(1);
+  }
+})();

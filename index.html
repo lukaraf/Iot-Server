@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="sr">
+  <head>
+    <meta charset="UTF-8" />
+    <title>IoT Live Chart</title>
+
+    <!-- Google Charts loader -->
+    <script src="https://www.gstatic.com/charts/loader.js"></script>
+
+    <script>
+      google.charts.load("current", { packages: ["corechart"] });
+      google.charts.setOnLoadCallback(initChart);
+
+      // === PODESI AKO MENJAŠ DEVICE ID ===
+      const DEVICE_UNIQUE_ID = "pico-temp-001";
+
+      let data, chart, options;
+
+      async function setFan(forceFanValue) {
+        try {
+          const res = await fetch("/api/device-message", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              device_unique_id: DEVICE_UNIQUE_ID,
+              params_to_send: { force_fan: forceFanValue },
+            }),
+          });
+
+          if (!res.ok) {
+            const t = await res.text();
+            alert("Greška: " + t);
+            return;
+          }
+
+          const out = await res.json();
+          console.log("Komanda poslata:", out);
+
+          const statusEl = document.getElementById("status");
+          if (statusEl) {
+            statusEl.textContent =
+              "Komanda poslata: force_fan=" +
+              (forceFanValue === null ? "AUTO" : forceFanValue);
+          }
+        } catch (err) {
+          console.error("Greška u slanju komande:", err);
+          alert("Fetch error: " + err.message);
+        }
+      }
+
+      function initChart() {
+        data = new google.visualization.DataTable();
+        data.addColumn("datetime", "Vreme");
+        data.addColumn("number", "Temperatura (°C)");
+
+        options = {
+          title: "Temperatura u realnom vremenu",
+          legend: { position: "bottom" },
+          curveType: "function",
+          height: 400,
+          hAxis: {
+            title: "Vreme",
+            format: "HH:mm:ss",
+          },
+          vAxis: {
+            title: "Temperatura (°C)",
+          },
+        };
+
+        chart = new google.visualization.LineChart(
+          document.getElementById("chart_div")
+        );
+
+        pollData();
+        setInterval(pollData, 1000);
+      }
+
+      function pollData() {
+        fetch("/api/data") // relativno, bez localhost
+          .then((r) => r.json())
+          .then((arr) => {
+            const n = data.getNumberOfRows();
+            if (n > 0) data.removeRows(0, n);
+
+            arr.forEach((item) => {
+              const t = new Date(item.timestamp || Date.now());
+              const temp = Number(item.temp ?? item.value);
+
+              if (!isNaN(temp)) {
+                data.addRow([t, temp]);
+              }
+            });
+
+            chart.draw(data, options);
+
+            // status (poslednji uzorak)
+            const statusEl = document.getElementById("status");
+            const last = arr[arr.length - 1];
+            if (statusEl) {
+              if (!last) {
+                statusEl.textContent = "Nema podataka...";
+              } else {
+                const t = new Date(last.timestamp || Date.now());
+                const temp = Number(last.temp ?? last.value);
+                const fan = last.fan;
+                const mode = last.mode || "unknown";
+                statusEl.textContent = `Last: ${t.toLocaleTimeString()} | temp=${isNaN(temp) ? "?" : temp.toFixed(2)}°C | fan=${fan} | mode=${mode}`;
+              }
+            }
+
+            // debug
+            const dbg = document.getElementById("debug");
+            if (dbg) {
+              dbg.innerHTML = "";
+              arr.slice(-5).forEach((item) => {
+                dbg.innerHTML += JSON.stringify(item) + "<br>";
+              });
+            }
+          })
+          .catch((err) => {
+            console.error("Greška u fetch-u:", err);
+            const statusEl = document.getElementById("status");
+            if (statusEl) statusEl.textContent = "Greška u /api/data fetch-u.";
+          });
+      }
+    </script>
+  </head>
+
+  <body>
+    <h1>IoT – temperatura u realnom vremenu</h1>
+
+    <div style="margin: 12px 0; display: flex; gap: 8px; align-items: center;">
+      <button onclick="setFan(1)">Fan ON</button>
+      <button onclick="setFan(0)">Fan OFF</button>
+      <button onclick="setFan(null)">AUTO</button>
+
+      <div id="status" style="margin-left: 16px; font-family: monospace;"></div>
+    </div>
+
+    <div id="chart_div"></div>
+
+    <h3>Poslednjih par uzoraka (debug):</h3>
+    <div id="debug" style="font-family: monospace; font-size: 12px;"></div>
+  </body>
+</html>

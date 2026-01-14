@@ -1,0 +1,6 @@
+MongoDB:
+
+username: lseselj16721ri_db_user
+password: EUeanODzYEeKWR3c
+
+mongodb+srv://lseselj16721ri_db_user:<db_password>@iot.zlenagm.mongodb.net/?retryWrites=true&w=majority&appName=iot

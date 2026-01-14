@@ -7,41 +7,35 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = 3000;
+// Render/hosting port
+const PORT = process.env.PORT || 3000;
 
-// ================== KONSTANTE ==================
+// Secrets/config iz env
+const MONGO_URL = process.env.MONGO_URL;
+const DB_NAME = process.env.MONGO_DB_NAME || "iot";
 
-const MONGO_URL =
-  "mongodb+srv://lseselj16721ri_db_user:2QbxMOE2nPiXPCvb@iot.zlenagm.mongodb.net/?retryWrites=true&w=majority&appName=iot";
-
-// JEDINSTVENI ID UREDJAJA (primer)
-const COOLING_DEVICE_UNIQUE_ID = "pico-temp-001";
+// Real-time TTL (kad nema novih podataka -> izbaci iz live stanja)
+const DEVICE_TTL_MS = Number(process.env.DEVICE_TTL_MS || 60_000); // npr 60000 = 60s
+const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 5_000);
 
 // ================== MONGODB SCHEMAS ==================
 
 const TemperatureSchema = new mongoose.Schema({
-  device_unique_id: { type: String, index: true },
-  value: Number,
-  fan: Number,
-  mode: { type: String, default: null }, // <-- DODATO (AUTO / FORCED_ON / FORCED_OFF)
+  device_unique_id: { type: String, index: true, required: true },
+  value: { type: Number, required: true },
+  fan: { type: Number, default: 0 },
+  mode: { type: String, default: null },
   timestamp: { type: Date, default: Date.now },
-});
-
-const DeviceSchema = new mongoose.Schema({
-  device_unique_id: { type: String, unique: true, index: true },
-  name: String,
-  location: String,
-  type: String,
 });
 
 const MessageSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now },
   device_unique_id: { type: String, required: true, index: true },
-  message: { type: mongoose.Schema.Types.Mixed, required: true }, // ceo payload (temp, fan, itd.)
+  message: { type: mongoose.Schema.Types.Mixed, required: true }, // ceo payload
 });
 
 const DeviceMessageSchema = new mongoose.Schema({
-  device_unique_id: { type: String, index: true },
+  device_unique_id: { type: String, index: true, required: true },
   timestamp: { type: Date, default: Date.now },
   params_to_send: { type: mongoose.Schema.Types.Mixed, required: true },
   consumed: { type: Boolean, default: false },
@@ -50,59 +44,64 @@ const DeviceMessageSchema = new mongoose.Schema({
 // ================== MONGODB MODELS ==================
 
 const Temperature = mongoose.model("Temperature", TemperatureSchema);
-const Device = mongoose.model("Device", DeviceSchema);
 const Message = mongoose.model("Message", MessageSchema);
 const DeviceMessage = mongoose.model("DeviceMessage", DeviceMessageSchema);
 
-// ================== INIT DEVICE (DEMO) ==================
+// ================== REAL-TIME STATE (RAM) ==================
+// Umesto “liveBuffer” globalno, držimo:
+const liveSamples = []; // zadnjih N sample-ova (za graf)
+const lastSeenByDevice = new Map(); // device_id -> lastSeenMs
+const lastSampleByDevice = new Map(); // device_id -> poslednji sample (za dashboard)
 
-async function ensureCoolingDeviceRegistered() {
+const LIVE_BUFFER_MAX = Number(process.env.LIVE_BUFFER_MAX || 50);
+
+// Cleanup: izbaci uređaje iz real-time stanja kad istekne TTL
+setInterval(() => {
+  const now = Date.now();
+  for (const [deviceId, lastSeen] of lastSeenByDevice.entries()) {
+    if (now - lastSeen > DEVICE_TTL_MS) {
+      lastSeenByDevice.delete(deviceId);
+      lastSampleByDevice.delete(deviceId);
+      // napomena: liveSamples ostaje kao graf istorija u RAM-u (poslednjih N),
+      // ali uređaj nestaje sa “live devices” liste.
+      console.log("🟡 Device expired from live state:", deviceId);
+    }
+  }
+}, CLEANUP_INTERVAL_MS);
+
+// ================== DB CONNECT ==================
+async function connectMongo() {
+  if (!MONGO_URL) {
+    console.error("❌ MONGO_URL nije postavljen (env var).");
+    process.exit(1);
+  }
+
   try {
-    const dev = await Device.findOneAndUpdate(
-      { device_unique_id: COOLING_DEVICE_UNIQUE_ID },
-      {
-        device_unique_id: COOLING_DEVICE_UNIQUE_ID,
-        name: "Pico cooling system",
-        location: "Room 1",
-        type: "temp+fan",
-      },
-      { upsert: true, new: true }
-    );
-    console.log("Device registrovan:", dev.device_unique_id);
+    await mongoose.connect(MONGO_URL, { dbName: DB_NAME });
+    console.log("✅ MongoDB povezano:", DB_NAME);
   } catch (err) {
-    console.error("Greška pri registraciji device-a:", err);
+    console.error("❌ MongoDB greška:", err.message);
+    process.exit(1);
   }
 }
 
-mongoose
-  .connect(MONGO_URL, { dbName: "iot" })
-  .then(async () => {
-    console.log("MongoDB povezano");
-    await ensureCoolingDeviceRegistered();
-  })
-  .catch((err) => console.log("MongoDB greška:", err.message));
+// ================== ROUTES ==================
 
-// ================== LIVE BUFFER ==================
-
-let liveBuffer = [];
-
-// ================== HEALTH ==================
 app.get("/health", (req, res) => {
-  res.json({ ok: true, mongoReadyState: mongoose.connection.readyState });
+  res.json({
+    ok: true,
+    mongoReadyState: mongoose.connection.readyState,
+    ttlMs: DEVICE_TTL_MS,
+  });
 });
 
-// ================== API – PICO W PREKO WiFi ==================
-
-// Pico šalje POST na /api/ingest sa JSON-om { device_unique_id, temp, fan, mode? }
+// Pico šalje POST /api/ingest { device_unique_id, temp, fan, mode? }
 app.post("/api/ingest", async (req, res) => {
   try {
-    const { device_unique_id, temp, fan, mode } = req.body; // <-- mode DODAT
+    const { device_unique_id, temp, fan, mode } = req.body;
 
-    // 1) validacija
     if (!device_unique_id || typeof device_unique_id !== "string") {
-      return res
-        .status(400)
-        .json({ error: "device_unique_id (string) je obavezan" });
+      return res.status(400).json({ error: "device_unique_id (string) je obavezan" });
     }
 
     const tempNum = Number(temp);
@@ -110,46 +109,34 @@ app.post("/api/ingest", async (req, res) => {
       return res.status(400).json({ error: "temp (number) je obavezan" });
     }
 
-    // 2) proveri da li je uređaj registrovan
-    const dev = await Device.findOne({ device_unique_id }).lean();
-    if (!dev) {
-      return res.status(403).json({ error: "unknown device" });
-    }
+    const fanNum = Number.isFinite(Number(fan)) ? Number(fan) : 0;
+    const modeStr = typeof mode === "string" ? mode : null;
 
-    // 3) upiši poruku u messages kolekciju (ceo payload)
+    const now = Date.now();
+    const sample = {
+      device_unique_id,
+      value: tempNum,
+      fan: fanNum,
+      mode: modeStr,
+      timestamp: new Date(),
+    };
+
+    // 1) REAL-TIME: upiši u RAM (live)
+    lastSeenByDevice.set(device_unique_id, now);
+    lastSampleByDevice.set(device_unique_id, sample);
+
+    liveSamples.push(sample);
+    if (liveSamples.length > LIVE_BUFFER_MAX) liveSamples.shift();
+
+    // 2) PERSIST: upiši u Mongo (istorija)
     if (mongoose.connection.readyState === 1) {
       await Message.create({
         device_unique_id,
         message: req.body,
         timestamp: new Date(),
       });
-    }
 
-    // 4) sample za graf + temperature kolekciju
-    const sample = {
-      device_unique_id,
-      value: tempNum,
-      fan: Number.isFinite(Number(fan)) ? Number(fan) : fan ?? 0,
-      mode: typeof mode === "string" ? mode : null, // <-- FIX: sad postoji mode
-      timestamp: new Date(),
-    };
-
-    // RAM buffer
-    liveBuffer.push(sample);
-    if (liveBuffer.length > 20) liveBuffer.shift();
-
-    // upis u Mongo
-    if (mongoose.connection.readyState === 1) {
       await Temperature.create(sample);
-      console.log(
-        "Sačuvano:",
-        device_unique_id,
-        tempNum,
-        "°C, fan =",
-        sample.fan,
-        "mode =",
-        sample.mode
-      );
     }
 
     return res.status(201).json({ status: "ok" });
@@ -159,43 +146,65 @@ app.post("/api/ingest", async (req, res) => {
   }
 });
 
-// podaci za grafikon (zadnjih 20 uzoraka u RAM-u)
+// Live graf: zadnjih N sample-ova u RAM-u
 app.get("/api/data", (req, res) => {
-  res.json(liveBuffer);
+  res.json(liveSamples);
 });
 
-// podaci iz baze (istorija)
+// Live devices: trenutno aktivni (nisu “expired”)
+app.get("/api/live-devices", (req, res) => {
+  const now = Date.now();
+  const result = [];
+
+  for (const [deviceId, sample] of lastSampleByDevice.entries()) {
+    const lastSeen = lastSeenByDevice.get(deviceId) || 0;
+    const ageMs = now - lastSeen;
+
+    // Ako je baš na ivici, nemoj vraćati
+    if (ageMs <= DEVICE_TTL_MS) {
+      result.push({
+        device_unique_id: deviceId,
+        lastSeenMs: lastSeen,
+        ageMs,
+        last: sample,
+      });
+    }
+  }
+
+  // najskoriji prvi
+  result.sort((a, b) => b.lastSeenMs - a.lastSeenMs);
+
+  res.json(result);
+});
+
+// Istorija iz baze (ne briše se na disconnect)
 app.get("/api/db-data", async (req, res) => {
   try {
-    const results = await Temperature.find()
+    const limit = Math.min(Number(req.query.limit || 50), 500);
+    const deviceId = req.query.device_unique_id;
+
+    const filter = deviceId ? { device_unique_id: deviceId } : {};
+    const results = await Temperature.find(filter)
       .sort({ timestamp: -1 })
-      .limit(50)
+      .limit(limit)
       .lean();
+
     res.json(results.reverse());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Web/UI šalje komandu uređaju: { device_unique_id, params_to_send }
+// UI šalje komandu uređaju
 app.post("/api/device-message", async (req, res) => {
   try {
     const { device_unique_id, params_to_send } = req.body;
 
     if (!device_unique_id || typeof device_unique_id !== "string") {
-      return res
-        .status(400)
-        .json({ error: "device_unique_id (string) je obavezan" });
+      return res.status(400).json({ error: "device_unique_id (string) je obavezan" });
     }
-
     if (params_to_send === undefined) {
       return res.status(400).json({ error: "params_to_send je obavezan" });
-    }
-
-    // proveri da li je uređaj registrovan
-    const dev = await Device.findOne({ device_unique_id }).lean();
-    if (!dev) {
-      return res.status(403).json({ error: "unknown device" });
     }
 
     const msg = await DeviceMessage.create({
@@ -212,9 +221,7 @@ app.post("/api/device-message", async (req, res) => {
   }
 });
 
-// Pico preuzima komandu: GET /api/device-message/:device_unique_id
-// - default: “consume” (potroši poruku)
-// - peek=1: samo pogledaj, ne troši
+// Pico povlači komandu: GET /api/device-message/:device_unique_id
 app.get("/api/device-message/:device_unique_id", async (req, res) => {
   try {
     const { device_unique_id } = req.params;
@@ -239,63 +246,17 @@ app.get("/api/device-message/:device_unique_id", async (req, res) => {
       consumed: msg.consumed,
     });
   } catch (err) {
-    console.error("Greška u GET /api/device-message/:id:", err);
+    console.error("Greška u GET /api/device-message/:device_unique_id:", err);
     return res.status(500).json({ error: "server error" });
   }
 });
 
-// svi uređaji + poslednje 3 temperature za svaki
-app.get("/devices", async (req, res) => {
-  try {
-    const devices = await Device.find().lean();
-
-    const result = await Promise.all(
-      devices.map(async (d) => {
-        const id = d.device_unique_id;
-        const name = d.name || id;
-        const location = d.location || "";
-        const isCooling = id === COOLING_DEVICE_UNIQUE_ID;
-
-        let lastThreeTemps = [];
-        if (id) {
-          const lastThree = await Temperature.find({ device_unique_id: id })
-            .sort({ timestamp: -1 })
-            .limit(3)
-            .lean();
-
-          lastThreeTemps = lastThree
-            .map((t) => ({
-              value: t.value,
-              fan: t.fan,
-              mode: t.mode ?? null, // <-- DODATO
-              timestamp: t.timestamp,
-            }))
-            .reverse();
-        }
-
-        return {
-          device_unique_id: id,
-          name,
-          location,
-          type: d.type || null,
-          isCooling,
-          lastThreeTemps,
-        };
-      })
-    );
-
-    res.json(result);
-  } catch (err) {
-    console.error("Greška u /devices:", err);
-    res.status(500).json({ error: "Neuspešno čitanje devices" });
-  }
-});
-
-// index.html za grafikon
+// (opciono) ako želiš da Render servira index.html
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
-app.listen(PORT, () => {
-  console.log(`Server radi na http://localhost:${PORT}`);
+// ================== START ==================
+connectMongo().then(() => {
+  app.listen(PORT, () => console.log(`✅ Server radi na portu ${PORT}`));
 });
